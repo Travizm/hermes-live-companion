@@ -1,0 +1,18 @@
+--- a/openai-realtime.adapter.js
++++ b/openai-realtime.adapter.js
+@@ -1,3 +1,4 @@
++// hermes-live-companion v0.1 patch — see https://github.com/Travizm/hermes-live-companion
+ import { randomUUID } from "node:crypto";
+ import WebSocket from "ws";
+ import { normalizePcm16Audio } from "../../../domain/audio/pcm.js";
+@@ -6,8 +7,8 @@
+ import { selectOpenAIHermesLiveTools } from "../../../application/live-gateway/tool-definitions.js";
+ const OPENAI_REALTIME_PCM_SAMPLE_RATE = 24_000;
+ const OPENAI_CANCEL_ACK_TIMEOUT_MS = 2_000;
+-const OPENAI_HANDSHAKE_TIMEOUT_MS = 10_000;
+-const DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS = 15_000;
++const OPENAI_HANDSHAKE_TIMEOUT_MS = 45_000;
++const DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS = 60_000;
+ const DEFAULT_PROVIDER_CLOSE_TIMEOUT_MS = 4_000;
+ const OPENAI_MAX_EVENT_BYTES = 16 * 1024 * 1024;
+ const OPENAI_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;

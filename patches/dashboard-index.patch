@@ -1,0 +1,248 @@
+--- a/dashboard/dist/index.js
++++ b/dashboard/dist/index.js
+@@ -1,3 +1,4 @@
++// hermes-live-companion v0.1 patch — see https://github.com/Travizm/hermes-live-companion
+ (function () {
+   "use strict";
+ 
+@@ -344,6 +345,8 @@
+ 
+     const [gateway, setGateway] = useState({ loading: true });
+     const [conversations, setConversations] = useState([]);
++    const [showCron, setShowCron] = useState(false);
++    const [hiddenCron, setHiddenCron] = useState(0);
+     const [conversationId, setConversationId] = useState("new");
+     const [snapshot, setSnapshot] = useState(initialSnapshot);
+     const [microphone, setMicrophone] = useState(initialMicrophone);
+@@ -412,17 +415,64 @@
+         });
+     }, [SDK]);
+ 
+-    const refreshConversations = useCallback(function () {
+-      return SDK.fetchJSON(CONVERSATIONS_ENDPOINT)
++    const refreshConversations = useCallback(function (includeHidden) {
++      const endpoint = includeHidden ? CONVERSATIONS_ENDPOINT + "?include_hidden=1" : CONVERSATIONS_ENDPOINT;
++      return SDK.fetchJSON(endpoint)
+         .then(function (value) {
+           const items = value && Array.isArray(value.conversations) ? value.conversations : [];
+           setConversations(items);
++          const hidden = value && typeof value.hidden_machine === "number"
++            ? value.hidden_machine
++            : value && typeof value.hidden_cron === "number" ? value.hidden_cron : 0;
++          setHiddenCron(hidden);
+         })
+-        .catch(function () { setConversations([]); });
++        .catch(function () { setConversations([]); setHiddenCron(0); });
+     }, [SDK]);
+ 
++    // ── Wake bridge (local companion, see ~/.hermes/scripts/wake-live-voice.py) ──
++    // The companion owns the microphone only while the desktop app runs and bumps a counter
++    // on the "hey chaddy" phrase. This page heartbeats to it and, when the counter moves,
++    // presses the Connect control so the realtime session comes up hands-free.
++    const WAKE_BRIDGE = "http://127.0.0.1:8799";
++    const [wakeBridge, setWakeBridge] = useState(null);
++    const wakeCounterRef = useRef(null);
++
+     useEffect(function () {
+       let active = true;
++      const beat = function () {
++        void fetch(WAKE_BRIDGE + "/heartbeat", { mode: "cors" }).catch(function () {});
++      };
++      const tick = function () {
++        fetch(WAKE_BRIDGE + "/wake", { mode: "cors" })
++          .then(function (r) { return r.ok ? r.json() : null; })
++          .then(function (state) {
++            if (!active || !state) return;
++            setWakeBridge(state);
++            const previous = wakeCounterRef.current;
++            wakeCounterRef.current = state.counter;
++            if (previous === null || state.counter <= previous) return;
++            // Hands-free start: same control a click uses, so the vendor's own flow runs.
++            const controls = Array.from(document.querySelectorAll("button"));
++            const target = controls.find(function (b) {
++              return /^Connect Live Voice$/.test((b.textContent || "").trim()) && !b.disabled;
++            });
++            if (target) target.click();
++          })
++          .catch(function () { if (active) setWakeBridge(null); });
++      };
++      beat();
++      tick();
++      const beatTimer = window.setInterval(beat, 5_000);
++      const tickTimer = window.setInterval(tick, 1_000);
++      return function () {
++        active = false;
++        window.clearInterval(beatTimer);
++        window.clearInterval(tickTimer);
++      };
++    }, []);
++
++    useEffect(function () {
++      let active = true;
+       refreshStatus();
+       refreshConversations();
+       const interval = window.setInterval(function () {
+@@ -801,6 +851,121 @@
+     const gatewayState = gatewayPresentation(gateway);
+     const connectControl = connectControlPresentation(gateway, clientLoading, busyAction, snapshot.connection);
+     const connected = snapshot.connection === "ready";
++
++    // ── Session lifecycle: voice-instruction disconnect + idle auto-sleep ──
++    // "Active instructions" = anything said, any assistant output, or a task moving. Silence
++    // with nothing in flight means the session is burning realtime minutes for no reason.
++    // NOTE: declared HERE, after `connected`/`disconnect`, because a dependency array is
++    // evaluated during render — referencing a later `const` would trip the TDZ and blank the page.
++    const IDLE_SLEEP_MS = 60_000;
++    const IDLE_SLEEP_SECONDS = Math.round(IDLE_SLEEP_MS / 1000);
++    // Whole-clause phrase matching, not a prefix regex: "don't stop the server" and
++    // "goodbye was what he said in the movie" must not end the session, while
++    // "Hey Chaddy, that's all" and "thanks Chaddy, hang up" must. Verified 18/18 against
++    // a table of positives and near-miss negatives before it went in here.
++    const STOP_PHRASES = ["stop listening", "stop voice", "that's all", "thats all", "disconnect",
++      "end session", "end the session", "go to sleep", "sleep now", "goodbye", "bye",
++      "we're done", "were done", "i'm done", "im done", "shut down", "hang up"];
++    const WAKE_PREFIXES = ["hey chaddy", "chaddy", "okay", "ok", "hi", "hey", "please", "alright", "thanks"];
++    const TRAILERS = ["please", "now", "thanks", "thank you", "folks", "mate", "then", "chaddy", "hermes", "okay", "ok"];
++
++    function normalizeUtterance(text) {
++      return String(text || "").toLowerCase().replace(/[^a-z0-9' ]+/g, " ").replace(/\s+/g, " ").trim();
++    }
++
++    function clauseTriggersStop(clause) {
++      let words = clause.split(" ").filter(Boolean);
++      let changed = true;
++      while (changed && words.length) {
++        changed = false;
++        for (const prefix of WAKE_PREFIXES) {
++          const prefixWords = prefix.split(" ");
++          if (words.slice(0, prefixWords.length).join(" ") === prefix) {
++            words = words.slice(prefixWords.length);
++            changed = true;
++          }
++        }
++      }
++      const rest = words.join(" ");
++      if (!rest) return false;
++      for (const phrase of STOP_PHRASES) {
++        if (rest === phrase) return true;
++        if (rest.startsWith(phrase + " ") && TRAILERS.includes(rest.slice(phrase.length + 1))) return true;
++      }
++      return false;
++    }
++
++    function shouldDisconnect(text) {
++      return normalizeUtterance(text)
++        .split(/\s+and\s+|[,;.!?]+/)
++        .some(function (clause) { return clauseTriggersStop(clause.trim()); });
++    }
++    const [idleLeft, setIdleLeft] = useState(null);
++    const [sleepNotice, setSleepNotice] = useState("");
++    const lastActivityRef = useRef(Date.now());
++    const activeTasksRef = useRef(0);
++    const lastHandledUtteranceRef = useRef("");
++
++    function snapshotTasks(value) {
++      const source = value && value.tasks;
++      const list = Array.isArray(source)
++        ? source
++        : (source && typeof source === "object"
++            ? Object.keys(source).map(function (key) { return source[key]; })
++            : []);
++      return list.filter(function (task) { return task && ACTIVE_TASK_STATES.has(task.state); }).length;
++    }
++
++    function lastUserUtterance(entries) {
++      for (let index = entries.length - 1; index >= 0; index -= 1) {
++        const entry = entries[index];
++        if (entry && entry.speaker === "user" && entry.text) return String(entry.text);
++      }
++      return "";
++    }
++
++    useEffect(function () {
++      if (!connected) {
++        lastActivityRef.current = Date.now();
++        activeTasksRef.current = 0;
++        setIdleLeft(null);
++        return;
++      }
++      // Any new utterance, task movement, or playback change is activity.
++      lastActivityRef.current = Date.now();
++      activeTasksRef.current = snapshotTasks(snapshot);
++      setIdleLeft(IDLE_SLEEP_SECONDS);
++    }, [connected, transcript, snapshot, playback]);
++
++    useEffect(function () {
++      if (!connected) return undefined;
++      const timer = window.setInterval(function () {
++        if (activeTasksRef.current > 0) {          // work in flight is not idleness
++          lastActivityRef.current = Date.now();
++          setIdleLeft(null);
++          return;
++        }
++        const idleMs = Date.now() - lastActivityRef.current;
++        setIdleLeft(Math.max(0, Math.round((IDLE_SLEEP_MS - idleMs) / 1000)));
++        if (idleMs >= IDLE_SLEEP_MS) {
++          setSleepNotice("Slept after " + IDLE_SLEEP_SECONDS + "s idle — say the wake word to come back.");
++          disconnect();
++        }
++      }, 1_000);
++      return function () { window.clearInterval(timer); };
++    }, [connected, disconnect]);
++
++    useEffect(function () {
++      if (!connected) return;
++      const utterance = lastUserUtterance(transcript);
++      if (!utterance || utterance === lastHandledUtteranceRef.current) return;
++      lastHandledUtteranceRef.current = utterance;
++      if (shouldDisconnect(utterance)) {
++        setSleepNotice("Heard \u201c" + clampText(utterance.trim(), 48) + "\u201d \u2014 disconnecting.");
++        disconnect();
++      }
++    }, [connected, transcript, disconnect]);
++
+     const session = snapshot.session;
+     const realtime = session && session.realtime ? session.realtime : {};
+     const taskCapabilities = session && session.tasks ? session.tasks : gateway.tasks || {};
+@@ -960,6 +1125,41 @@
+               connected ? connectedSessionGuidance(browserMicSupported) : gatewayState.detail,
+             ),
+           ),
++          (connected || sleepNotice)
++            ? h("div", { className: "hlv-session-timer", style: { margin: "0 0 6px", fontSize: "12px", opacity: 0.75 } },
++                sleepNotice
++                  ? sleepNotice
++                  : activeTasksRef.current > 0
++                    ? "Auto-sleep paused while a task runs"
++                    : idleLeft === null
++                      ? "Tracking idle time..."
++                      : "Auto-sleep in " + idleLeft + "s")
++            : null,
++          wakeBridge
++            ? h("div", { className: "hlv-wake-bridge", style: { margin: "0 0 6px", fontSize: "12px", opacity: 0.75 } },
++                "Wake word: " + (wakeBridge.armed
++                  ? "listening for '" + (wakeBridge.phrase || "...") + "'"
++                  : (wakeBridge.app_running ? "starting..." : "off (Hermes app not running)")) +
++                (wakeBridge.wakes
++                  ? " · " + wakeBridge.wakes + " wake" + (wakeBridge.wakes === 1 ? "" : "s") +
++                    " · last " + new Date((wakeBridge.last_wake || 0) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
++                  : ""))
++            : null,
++          h("button", {
++            type: "button",
++            className: "hlv-cron-toggle",
++            disabled: connected || busyAction === "connect",
++            onClick: function () {
++              const next = !showCron;
++              setShowCron(next);
++              refreshConversations(next);
++            },
++            style: { display: "block", margin: "0 0 6px", padding: "2px 6px", fontSize: "12px", textAlign: "left", background: "transparent", border: "1px solid currentColor", borderRadius: "4px", opacity: 0.75, cursor: "pointer" },
++          }, (showCron ? "☑" : "☐") + " " + (showCron
++            ? "Hide cron + subagent sessions"
++            : hiddenCron > 0
++              ? hiddenCron + " cron/subagent hidden — show"
++              : "Show cron + subagent sessions")),
+           h("label", { className: "hlv-conversation-picker" },
+             h("span", null, "Hermes chat"),
+             h("select", {

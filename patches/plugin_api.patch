@@ -1,0 +1,176 @@
+--- a/dashboard/plugin_api.py
++++ b/dashboard/plugin_api.py
+@@ -4,6 +4,7 @@
+ stay in the Hermes process environment and are attached to the upstream
+ connection server-side.
+ """
++# hermes-live-companion v0.1 patch — see https://github.com/Travizm/hermes-live-companion
+ 
+ from __future__ import annotations
+ 
+@@ -16,7 +17,7 @@
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any
+-from urllib.parse import urlsplit, urlunsplit
++from urllib.parse import quote, urlsplit, urlunsplit
+ 
+ import httpx
+ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+@@ -38,6 +39,22 @@
+ MAX_TOKEN_BYTES = 8_192
+ MAX_GATEWAY_URL_CHARS = 2_048
+ STATUS_TIMEOUT_SECONDS = 2.5
++# The conversations probe reads the persisted chat list through the gateway, which
++# queries the Hermes session store. A COLD call on a large state DB measured 3.1-3.8s,
++# which exceeded the 2.5s status timeout: the saved-chat picker came back empty
++# ("conversations_unavailable") and voice could only ever start a NEW chat.
++CONVERSATIONS_TIMEOUT_SECONDS = 15.0
++# Machine-generated sessions swamp the picker on a scheduled setup: this profile held
++# cron 13834 / subagent 1145 against 327 desktop chats, so a recency-ordered list is ~98%
++# noise and a chat you actually want is buried. Hidden by default, reachable via
++# ?include_hidden=1. A denylist rather than an allowlist is deliberate: a newly connected
++# interactive platform must show up with no code change, while machine sources are few.
++HIDDEN_SESSION_SOURCES = ("cron", "subagent")
++# Discovery from the newest page cannot see a source whose sessions are all older (e.g. 12
++# telegram chats), and Hermes' session API filters ONE exact source per call, so the known
++# interactive sources are seeded and anything else discovered is added on top.
++SEED_SESSION_SOURCES = ("desktop", "api_server", "telegram", "cli", "tui")
++CONVERSATIONS_PAGE_SIZE = 100
+ MAX_CONVERSATIONS = 50
+ MAX_MANAGED_CONFIG_BYTES = 64 * 1024
+ _MANAGED_GATEWAY_KEYS = {
+@@ -324,9 +341,16 @@
+ 
+ 
+ @router.get("/conversations")
+-async def gateway_conversations() -> dict[str, Any]:
+-    """Return a bounded, sanitized list of persisted Hermes chats."""
++async def gateway_conversations(include_hidden: bool = False, include_cron: bool = False) -> dict[str, Any]:
++    """Return a bounded, sanitized list of persisted Hermes chats.
++
++    Machine-generated sessions (``HIDDEN_SESSION_SOURCES``) are hidden by default so the
++    picker holds chats; ``?include_hidden=1`` returns the raw newest-first list, and
++    ``include_cron`` is kept as an alias for older bundles.
++    """
+ 
++    include_hidden = include_hidden or include_cron
++
+     try:
+         gateway_url = _gateway_url()
+         token = _gateway_token()
+@@ -334,33 +358,90 @@
+         return {"conversations": [], "error": "invalid_gateway_configuration"}
+ 
+     headers = {"Authorization": f"Bearer {token}"} if token else None
+-    timeout = httpx.Timeout(STATUS_TIMEOUT_SECONDS, connect=min(1.5, STATUS_TIMEOUT_SECONDS))
+-    async with httpx.AsyncClient(
+-        follow_redirects=False,
+-        timeout=timeout,
+-        limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+-        trust_env=False,
+-        headers={"Accept": "application/json"},
+-    ) as client:
+-        probe = await _fetch_json(
+-            client,
+-            f"{gateway_url}/v1/conversations?limit={MAX_CONVERSATIONS}",
+-            headers,
+-        )
++    timeout = httpx.Timeout(CONVERSATIONS_TIMEOUT_SECONDS, connect=min(1.5, CONVERSATIONS_TIMEOUT_SECONDS))
++    sensitive = (token,) if token else ()
+ 
+-    if not probe.ok or not isinstance(probe.body, dict):
+-        return {"conversations": [], "error": "conversations_unavailable"}
+-    raw = probe.body.get("conversations")
+-    if not isinstance(raw, list):
+-        return {"conversations": [], "error": "conversations_unavailable"}
+-    conversations = []
+-    for item in raw[:MAX_CONVERSATIONS]:
+-        safe = _safe_conversation(item, sensitive_values=(token,) if token else ())
+-        if safe is not None:
+-            conversations.append(safe)
+-    return {"conversations": conversations, "error": None}
++    conversations: list[dict[str, Any]] = []
++    hidden_machine = 0
++    scanned = 0
++    try:
++        async with httpx.AsyncClient(
++            follow_redirects=False,
++            timeout=timeout,
++            limits=httpx.Limits(max_connections=CONVERSATIONS_PAGE_SIZE, max_keepalive_connections=0),
++            trust_env=False,
++            headers={"Accept": "application/json"},
++        ) as client:
++            def _items(probe: "_Probe") -> list:
++                if not probe.ok or not isinstance(probe.body, dict):
++                    return []
++                raw = probe.body.get("conversations")
++                return raw if isinstance(raw, list) else []
+ 
++            newest_probe = await _fetch_json(
++                client,
++                f"{gateway_url}/v1/conversations?limit={CONVERSATIONS_PAGE_SIZE}&offset=0",
++                headers,
++            )
++            if not newest_probe.ok or not isinstance(newest_probe.body, dict):
++                return {"conversations": [], "error": "conversations_unavailable"}
++            newest = _items(newest_probe)
++            scanned = len(newest)
+ 
++            if include_hidden:
++                for item in newest:
++                    safe = _safe_conversation(item, sensitive_values=sensitive)
++                    if safe is not None:
++                        conversations.append(safe)
++            else:
++                safe_newest = [
++                    s for s in (_safe_conversation(i, sensitive_values=sensitive) for i in newest) if s
++                ]
++                hidden_machine = sum(
++                    1 for s in safe_newest if s.get("source") in HIDDEN_SESSION_SOURCES
++                )
++                # Recency-ordered paging cannot reach older chats on a machine-generated
++                # heavy profile (the scheduler filled 487 of the newest 500), so each
++                # interactive source is fetched directly instead — one call each, in
++                # parallel, reaching that source's own deep history.
++                targets = sorted(
++                    {s.get("source") for s in safe_newest
++                     if s.get("source") and s.get("source") not in HIDDEN_SESSION_SOURCES}
++                    | set(SEED_SESSION_SOURCES)
++                )
++                per_source = await asyncio.gather(*(
++                    _fetch_json(
++                        client,
++                        f"{gateway_url}/v1/conversations?limit={CONVERSATIONS_PAGE_SIZE}"
++                        f"&source={quote(source, safe='')}",
++                        headers,
++                    )
++                    for source in targets
++                ))
++                seen_ids: set = set()
++                for probe in per_source:
++                    for item in _items(probe):
++                        safe = _safe_conversation(item, sensitive_values=sensitive)
++                        if safe is None or safe["id"] in seen_ids:
++                            continue
++                        if safe.get("source") in HIDDEN_SESSION_SOURCES:
++                            continue
++                        seen_ids.add(safe["id"])
++                        conversations.append(safe)
++                conversations.sort(key=lambda item: item.get("lastActive") or 0, reverse=True)
++                del conversations[MAX_CONVERSATIONS:]
++    except Exception:
++        if not conversations:
++            return {"conversations": [], "error": "conversations_unavailable"}
++
++    payload: dict[str, Any] = {"conversations": conversations, "error": None}
++    if not include_hidden:
++        payload["hidden_machine"] = hidden_machine
++        payload["hidden_cron"] = hidden_machine  # legacy key for older plugin bundles
++        payload["scanned"] = scanned
++    return payload
++
++
+ def _empty_status(*, configured: bool, error: str) -> dict[str, Any]:
+     return {
+         "configured": configured,
